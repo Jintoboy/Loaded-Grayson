@@ -296,8 +296,9 @@ The standalone Abiotic Factor Mod Editor (`AbioticFactorEditorCooked-Win64-Test.
 To package and publish your mod:
 1. In the Mod Editor toolbar, click the **Mod.io / "Upload Mod"** button.
 2. Select **"Add New Mod Listing"** (or choose your existing listing).
-3. Under **Mod Root Directory (`ModRootDir`)**, select your project folder:
-   `C:\Users\vczle\Documents\Abiotic Factor Mods\MyProjecty8BQn`
+3. Under **Mod Root Directory (`ModRootDir`)**, select the clean plugin directory inside this repository:
+   `C:\Users\vczle\Documents\Abiotic Factor Mods\Loaded-Grayson\MyProjecty8BQn`
+   *(Important: Do NOT select the repository root `Loaded-Grayson/`! The Mod.io upload tool zips the entire selected directory into `modfile_*.zip`. Selecting `MyProjecty8BQn/` ensures only the necessary `.uplugin`, `Content/`, and `Media/` files are uploaded, keeping the archive small (~15 KB) and free of development files or git history.)*
 4. Configure upload fields:
    * **Platform**: Check **`Windows`**.
    * **Version String**: e.g., `1.0.0`.
@@ -316,4 +317,60 @@ You can verify your mod in the real Steam game before releasing it publicly:
   * Any cooked `.pak`, `.ucas`, and `.utoc` files can be placed directly into:
     `C:\Program Files (x86)\Steam\steamapps\common\AbioticFactor\AbioticFactor\Content\Paks\~mods\`
   * The game engine mounts `~mods` automatically on launch without any internet connection or mod.io subscription required.
+
+---
+
+## 9. Plugin Mount Points & Mod Prefix Collision Rules
+
+### A. Strict Plugin Folder Naming & Engine Mount Points
+In Unreal Engine, the directory containing `.uplugin` defines the plugin's virtual package mount point (`/<FolderName>/`):
+- In this mod, the folder is **`MyProjecty8BQn`**, creating the mount point **`/MyProjecty8BQn/`**.
+- All internal asset paths (e.g., `/MyProjecty8BQn/DataTables/DT_NPC_TraderItems/trader_MyProject`) are hardcoded to this mount point in the serialized binary data.
+- **Do not rename the folder** `MyProjecty8BQn` (e.g., to `LoadedGrayson` or `src`). Renaming the directory without binary package re-serialization or Unreal asset redirectors will break all package imports and crash the game engine.
+- To display a user-friendly name in mod menus and stores, customize `FriendlyName` in `MyProjecty8BQn.uplugin` (set to `"FriendlyName": "Loaded Grayson"`).
+
+### B. Mod Prefix Collision (`UABFRowRegistrySubsystem`)
+At runtime, Abiotic Factor's `UABFRowRegistrySubsystem::OnUGCPackagesChanged` discovers installed mods by scanning for `.abfmod` and `.uplugin` packages, reading each mod's `ModPrefix` from `Content/AbioticModConfig.uasset` (e.g., `NR77R`):
+- **Collision Warning**: If two separate folders on disk contain the same `ModPrefix`, the engine logs:
+  `Mod plugins '%s' and '%s' share the row prefix '%s' (copied mod?). Their row namespaces merge; per-row conflicts take last registered.`
+- **Rule**: Never keep duplicate copies of the plugin folder (e.g., an unzipped backup and a working copy) inside the scanned mod directories. Maintain only one active plugin directory with a given `ModPrefix`.
+
+---
+
+## 10. Development Workflow, File Locks & Git Best Practices
+
+### A. Windows File Locks & Asset Memory-Mapping
+1. **Unreal Editor Asset Lock (`[Errno 13] Permission denied`)**:
+   - The Unreal Editor memory-maps loaded `.uasset` files on disk while open.
+   - Any attempt to run python binary patchers (e.g., `python Tools/ammo_exchange.py --apply`) while the editor is running will fail with a file lock error.
+   - **Always close the Abiotic Factor Mod Editor** before running binary modification scripts.
+2. **Current Working Directory Lock**:
+   - If a shell or terminal process has a directory set as its Current Working Directory (CWD), Windows prevents deleting or moving that directory (`Cannot move item because the item at '...' is in use`).
+   - Navigate away (`cd ..` or `Set-Location`) before attempting to move or delete directory trees.
+
+### B. Multi-Account Git & GitHub CLI Device Authentication
+When working on GitHub projects across multiple user accounts on Windows:
+- Windows Git Credential Manager caches credentials per-host (`git:https://github.com`).
+- To push using a specific GitHub account (`Jintoboy`):
+  1. Use the GitHub CLI device code flow: `gh auth login --web -h github.com -p https`
+  2. Visit [https://github.com/login/device](https://github.com/login/device) in your browser and authorize the one-time code while signed into the target account.
+  3. Run `gh auth setup-git` to configure Git to use `gh` as the active credential helper.
+  4. Ensure repository local config has matching commit authorship:
+     ```powershell
+     git config user.name "Jintoboy"
+     git config user.email "jintoboy@gmail.com"
+     ```
+
+---
+
+## 11. Mod.io Storefront Copy & Formatting Guidelines
+
+### A. Formatting for Mod.io Descriptions
+- The Mod.io web description editor does **not** render GitHub-flavored Markdown pipe tables (`| col | col |`). Tables will render as broken, unaligned plain text.
+- Instead, format trade tables and feature lists using **clean unicode bullet points (`•`)**, clear uppercase section headers, and direct arrows (`Give X -> Receive Y`).
+
+### B. Summary Character Limit
+- Mod.io enforces a short summary character limit displayed on search cards and game client menus.
+- Keep the summary punchy, weapon-aligned, and under 100 characters:
+  > *"Magazine-sized ammo batches, increased stock, and balanced ammo conversion trades for Grayson."*
 
