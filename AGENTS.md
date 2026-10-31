@@ -374,3 +374,84 @@ When working on GitHub projects across multiple user accounts on Windows:
 - Keep the summary punchy, weapon-aligned, and under 100 characters:
   > *"Magazine-sized ammo batches, increased stock, and balanced ammo conversion trades for Grayson."*
 
+---
+
+## 12. Unreal Engine 5 Audio System & Sound Cue Architecture
+
+### A. The `SoundNodeConcatenator` + `SoundNodeMixer` Duration Calculation Bug
+In Unreal Engine's Sound Cue system, nesting a **`SoundNodeMixer`** as an input child to a **`SoundNodeConcatenator`** introduces a critical duration-calculation bug:
+* **The Root Cause**: When calculating total cue duration (`USoundNodeConcatenator::GetDuration()`), the Concatenator queries the Mixer. In UE5, `USoundNodeMixer::GetDuration()` evaluates to the duration of its **first input child only** (`ChildNodes[0]`), completely ignoring subsequent inputs on the mixer.
+* **The Symptom (Premature Truncation)**: If Input 1 of the Mixer is short (e.g. `BingBong` @ 1.22s) while Input 2 is longer (e.g. `StandClear` @ 2.55s with a delay), the Concatenator calculates the total cue lifetime based on 1.22s. When played in-game, the audio component hits this truncated duration and **abruptly terminates the voice mid-sentence**, regardless of how much audio remains in subsequent concatenated nodes.
+* **The Solution (Pure Root Mixer)**:
+  To play sequential sounds with overlapping layers (e.g. chime ringing first, with voice beginning before the chime reverb tail ends), **eliminate the `Concatenator` entirely** and make **`SoundNodeMixer` the root node** connected to `Output`:
+  ```text
+  [Wave Player: BingBong] -----------------------------------------------------> Input 1
+  [Wave Player: StandClear] ----------> [Delay (0.8s)] ------------------------> Input 2  ---> [Mixer] ---> [Output Speaker]
+  [Wave Player: RouteAnnouncement] ---> [Delay (3.6s)] ------------------------> Input 3
+  ```
+  `USoundNodeMixer` at the root computes `FMath::Max()` across all branches, guaranteeing the total duration equals the longest path ($3.6\text{s} + 6.32\text{s} = 9.92\text{s}$). Nothing gets truncated.
+
+### B. Sound Wave Voice Management (`EVirtualizationMode`)
+Every `USoundWave` asset in Unreal Engine has a `VirtualizationMode` property under **Voice Management**:
+* **`Disabled` / `Restart` (UE Defaults)**: If an active sound suffers an audio thread hitch, volume drop, or level-streaming transition, the engine permanently kills the sound or resets playback to sample 0.
+* **`PlayWhenSilent` (Mandatory for Voice & Dialogue)**: The virtual playhead continues tracking playback position even if volume drops to 0 or during level streaming hitches. The audio never cuts off mid-sentence.
+* **Rule**: All custom mod dialogue, voice lines, and transit announcements **must** have `VirtualizationMode` set to **`PlayWhenSilent`**.
+
+### C. `SpawnSoundAttached` Lifecycles & Level Streaming
+When attaching sounds to moving vehicles (`SpawnSoundAttached` onto `Tram.MainBody`):
+* **`bStopWhenAttachedToDestroyed`**: In streaming worlds like Abiotic Factor (`Facility.umap` with streaming sublevels `Facility_Containment`, `Facility_Offices`), moving actors crossing streaming volumes can have their primitive components unregistered and reregistered. If `bStopWhenAttachedToDestroyed` is `true`, the `AudioComponent` interprets component reregistration as destruction and terminates playback.
+* **Rule**: Set **`bStopWhenAttachedToDestroyed = false`** on all `SpawnSoundAttached` nodes.
+
+### D. 3D Spatial Attenuation Pitfalls (`Att_Tram` vs. `None`)
+* Base-game attenuation assets like `/Game/Audio/Att_Tram` are built for exterior mechanical sounds (brake squeaks and motor humming). They often have aggressive **line-of-sight occlusion tracing** enabled.
+* As a tram travels through narrow tunnels, passes blast doors, or crosses portal volumes, the occlusion line trace hits geometry and drops volume to zero.
+* For passenger cabin announcements, use **`Attenuation Settings = None`** (or create a custom attenuation asset with **`bEnableOcclusion = false`** and an inner radius encompassing the cabin).
+
+---
+
+## 13. Abiotic Factor Runtime Architecture & Persistent Mod Systems
+
+### A. Spawning Persistent Managers via `DT_ClassManager` & `Abiotic_AIDirector`
+Content-only Unreal mods (`NoCode: true`) cannot register custom C++ game modes or engine subsystems. To execute persistent background logic across the entire facility:
+1. Create an Actor Component inheriting from **`/Game/Blueprints/Environment/Systems/StalkingNpcDirector_ParentBP`** (e.g., `CMTADirectorComponent`).
+2. Register this component in `DT_ClassManager` (via `UAbioticModRowAsset`).
+3. On level load, the base game's persistent **`Abiotic_AIDirector`** automatically instantiates your component on the Server.
+4. On `BeginPlay`, your director component calls `GetAllActorsOfClass` to verify no manager exists, then calls `SpawnActor(BP_MTA_TramAudioManager)` with `bAlwaysRelevant = true`.
+
+### B. Replicated Manager Pattern (Server Watcher + Multicast RPC)
+To keep network overhead near zero while synchronizing audio across singleplayer, listen-server hosts, and dedicated server clients:
+* **Server Authority**: The manager's `Event Tick` runs a low-frequency polling loop (`0.2s` Tick Interval, zero CPU footprint) on `Authority` only.
+* **Client Audio Playback**: When a state transition occurs (tram starts moving or doors open at a station), the Server invokes a **`Reliable Multicast` Custom Event** (`Multicast_PlayTramSound`).
+* **Dedicated Server Bypass**: In the multicast event, add `Branch (NOT IsDedicatedServer)` so headless servers skip audio processing while local clients spawn the local `AudioComponent`.
+* **Overlap Protection**: Store active `AudioComponent` references in a Map (`TMap<Tram_Default, AudioComponent>`). Before playing a new announcement for a given tram, call `IsValid -> Stop()` on any previous announcement so voice lines never overlap if buttons are spammed.
+
+### C. Tram Subsystem Internals (`Tram_ParentBP` & `Tram_Default`)
+Trams in Abiotic Factor expose several critical replicated properties:
+* **`Moving` (`bool`)**: `true` when the motor is advancing the tram along the spline rail.
+* **`TramDoorState` (`E_TramDoorState` enum)**:
+  - `Closed` (0)
+  - `OpenPortSide` (1)
+  - `OpenStarboardSide` (2)
+  - `OpenBothSides` (3)
+* **`PreviousStation` / `TargetStation` (`TramSystem_Station`)**: Station actors docking the tram.
+* **`PositiveDirection` (`bool`)**: Spline direction traveling towards positive or negative stop points.
+
+### D. Distinguishing Intermediate Blast Doors from True Station Platforms
+Trams pause at intermediate track points (`TramSystem_Trigger`) to wait for blast doors, bridges, or security barriers to open (`Moving` flips from `true` to `false`).
+* **The Fragile Workaround**: Testing `GetDistanceTo(Station) < Threshold` relies on magic numbers that break across lines with different platform lengths or pivot points.
+* **The Elegant Native Solution**:
+  - Intermediate blast doors pause the tram with **`TramDoorState == Closed`**.
+  - Station platforms dock the tram and open passenger doors (**`TramDoorState != Closed`**).
+  - Checking `TramDoorState != Closed` on the arrival branch completely eliminates false arrivals at intermediate blast doors with zero magic numbers!
+
+### E. Blueprint Map & String Node Gotchas
+1. **Map `FIND` Output Pins**:
+   - In Unreal Engine Blueprints, the Map `FIND` node has two right-hand outputs:
+     * **Top Pin**: `Value` (the stored value type, e.g., `Boolean` out-parameter).
+     * **Bottom Pin**: `Return Value` (`Boolean` indicating whether the key was found in the map).
+   - When branching on whether a key's boolean value is true/false, connect the **Top Pin** (`Value`). Connecting the bottom pin branches on whether the key was present in the map!
+2. **String `Append` Ordering**:
+   - `Append(A, B, C)` outputs `A + B + C`.
+   - When mapping routing keys formatted as `Origin->Destination` (e.g., `TramSystem_Station_C_11->TramSystem_Station_C_14`), ensure `Previous Station` feeds pin `A` and `Target Station` feeds pin `C`. Swapping pins generates `Destination->Origin`, breaking dictionary lookups.
+
+
